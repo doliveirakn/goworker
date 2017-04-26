@@ -8,8 +8,11 @@ import (
 
 	"golang.org/x/net/context"
 
+	"errors"
+	"github.com/FZambia/go-sentinel"
 	"github.com/cihub/seelog"
 	"github.com/youtube/vitess/go/pools"
+	"net"
 )
 
 var (
@@ -87,12 +90,68 @@ func Init() error {
 // while they wait for an available connection. Expect this
 // API to change drastically.
 func GetConn() (*RedisConn, error) {
+	if workerSettings.RedisSettings.MasterName == "" {
+		return getConn()
+	} else {
+		return getConnSentinel()
+	}
+}
+
+func getConn() (*RedisConn, error) {
 	resource, err := pool.Get(ctx)
 
 	if err != nil {
 		return nil, err
 	}
 	return resource.(*RedisConn), nil
+
+}
+func getConnSentinel() (*RedisConn, error) {
+	deadConnection := errors.New("Dead connection")
+	slaveConnection := errors.New("Stale connection (to slave, not master)")
+	try := func() (*RedisConn, error) {
+		resource, err := pool.Get(ctx)
+
+		if err != nil {
+			return nil, err
+		}
+		conn := resource.(*RedisConn)
+
+		// if the instance does not ping back
+		_, err = conn.Do("ping")
+		if err != nil {
+			conn.Close()
+			PutConn(nil)
+			return nil, deadConnection
+		}
+
+		// or is not a master any more
+		if !sentinel.TestRole(conn.Conn, "master") {
+			conn.Close()
+			PutConn(nil)
+			return nil, slaveConnection
+		}
+
+		return conn, nil
+	}
+
+	var conn *RedisConn
+	var err error
+	for i := 0; i < workerSettings.Connections+1; i++ {
+		if conn, err = try(); err == nil {
+			return conn, nil
+		} else if err != slaveConnection && err != deadConnection {
+			if err, ok := err.(net.Error); ok {
+				if !err.Timeout() {
+					return nil, err
+				}
+			} else {
+				return nil, err
+			}
+		}
+	}
+
+	return conn, err
 }
 
 // PutConn puts a connection back into the connection pool.
